@@ -33,10 +33,7 @@
 
   <!-- Include source generator -->
   <ItemGroup>
-    <ProjectReference Include="..\Microsoft.Agents.AI.Workflows.Generators\Microsoft.Agents.AI.Workflows.Generators.csproj"
-                      OutputItemType="Analyzer"
-                      ReferenceOutputAssembly="false"
-                      GlobalPropertiesToRemove="TargetFramework" />
+    <ProjectReference Include="..\Microsoft.Agents.AI.Workflows.Generators\Microsoft.Agents.AI.Workflows.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" GlobalPropertiesToRemove="TargetFramework" />
   </ItemGroup>
 
   <ItemGroup>

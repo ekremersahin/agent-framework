@@ -1,0 +1,151 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.Agents.AI.Workflows.Supervisor.Specialized;
+using ExecutorFactoryFunc = System.Func<Microsoft.Agents.AI.Workflows.ExecutorConfig<Microsoft.Agents.AI.Workflows.ExecutorOptions>,
+                                        string,
+                                        System.Threading.Tasks.ValueTask<Microsoft.Agents.AI.Workflows.Supervisor.Specialized.SupervisorOrchestrator>>;
+
+namespace Microsoft.Agents.AI.Workflows;
+
+/// <summary>
+/// Fluent builder for creating Magentic One multi-agent orchestration workflows.
+///
+/// Magentic One workflows use an LLM-powered manager to coordinate multiple agents through dynamic task planning, progress tracking,
+/// and adaptive replanning.The manager creates plans, selects agents, monitors progress, and determines when to replan or complete.
+///
+/// The builder provides a fluent API for configuring participants, the manager, optional plan review, checkpointing, and event
+/// callbacks.
+///
+/// Human-in-the-loop Support: Magentic provides specialized HITL mechanisms via:
+/// - `RequirePlanSignoff` - Review and approve/revise plans before execution
+/// - Tool approval via `function_approval_request`: Approve individual tool calls on participating agents. Note that tool calls are
+///   not supported on the ManagerAgent.
+/// </summary>
+/// <param name="managerAgent"></param>
+public class SupervisorWorkflowBuilder(AIAgent managerAgent) : OrchestrationBuilderBase<SupervisorWorkflowBuilder>
+{
+    private readonly List<AIAgent> _team = new();
+    private int _maxStalls = TaskLimits.DefaultMaxStallCount;
+    private int? _maxRounds;
+    private int? _maxResets;
+    private bool _requirePlanSignoff = true;
+
+    /// <inheritdoc cref="GroupChatWorkflowBuilder.AddParticipants(IEnumerable{AIAgent})"/>
+    public SupervisorWorkflowBuilder AddParticipants(params IEnumerable<AIAgent> agents)
+    {
+        this._team.AddRange(agents);
+        return this;
+    }
+
+    /// <summary>
+    /// Set the maximum number of coordination rounds. <see langword="null"/> means unlimited.
+    /// </summary>
+    /// <returns></returns>
+    public SupervisorWorkflowBuilder WithMaxRounds(int? maxRounds = null)
+    {
+        this._maxRounds = maxRounds;
+        return this;
+    }
+
+    /// <summary>
+    /// Set the maximum number ofnumber of resets allowed. <see langword="null"/> means unlimited.
+    /// </summary>
+    /// <returns></returns>
+    public SupervisorWorkflowBuilder WithMaxResets(int? maxResets = null)
+    {
+        this._maxResets = maxResets;
+        return this;
+    }
+
+    /// <summary>
+    /// Set the maximum number of consecutive rounds without progress before replan (default 3).
+    /// </summary>
+    /// <returns></returns>
+    public SupervisorWorkflowBuilder WithMaxStalls(int maxStalls = TaskLimits.DefaultMaxStallCount)
+    {
+        this._maxStalls = maxStalls;
+        return this;
+    }
+
+    /// <summary>
+    /// If <see langword="true"/>, requires human approval of the initial plan or any updates before proceeding. True by default.
+    /// </summary>
+    /// <param name="requirePlanSignoff"></param>
+    /// <returns></returns>
+    public SupervisorWorkflowBuilder RequirePlanSignoff(bool requirePlanSignoff = true)
+    {
+        this._requirePlanSignoff = requirePlanSignoff;
+        return this;
+    }
+
+    private WorkflowBuilder ReduceToWorkflowBuilder()
+    {
+        // Create a copy of the team so that improper modifications by using the builder after .Build() do not affect the
+        // workflow in unexpected ways.
+        List<AIAgent> team = [.. this._team];
+
+        ExecutorBinding orchestrator = CreateOrchestratorBinding(managerAgent, team, this.Limits, this._requirePlanSignoff);
+        WorkflowBuilder result = new(orchestrator);
+
+        AIAgentHostOptions options = new()
+        {
+            ReassignOtherAgentsAsUsers = true,
+            ForwardIncomingMessages = false
+        };
+
+        Dictionary<AIAgent, ExecutorBinding> teamMap = new(AIAgentIDEqualityComparer.Instance);
+        List<ExecutorBinding> teamBindings = [];
+        foreach (AIAgent agent in team)
+        {
+            ExecutorBinding binding = agent.BindAsExecutor(options);
+            teamBindings.Add(binding);
+            teamMap[agent] = binding;
+
+            result.AddEdge(binding, orchestrator);
+        }
+
+        result.AddFanOutEdge(orchestrator, teamBindings);
+
+        this.ApplyOutputDesignations(result, teamMap, "Magentic", () =>
+        {
+            result.WithOutputFrom(orchestrator);
+            if (teamMap.Count > 0)
+            {
+                result.WithIntermediateOutputFrom([.. teamMap.Values]);
+            }
+        });
+
+        this.ApplyMetadata(result);
+        return result;
+    }
+
+    /// <inheritdoc cref="WorkflowBuilder.Build"/>
+    public Workflow Build()
+    {
+        if (this._team.Count == 0)
+        {
+            throw new InvalidOperationException("At least one participant must be added via AddParticipants() before building the workflow.");
+        }
+
+        return this.ReduceToWorkflowBuilder().Build();
+    }
+
+    private TaskLimits Limits => new(
+        MaxRoundCount: this._maxRounds,
+        MaxResetCount: this._maxResets,
+        MaxStallCount: this._maxStalls);
+
+    private static ExecutorBinding CreateOrchestratorBinding(AIAgent managerAgent, List<AIAgent> team, TaskLimits limits, bool requirePlanSignoff)
+    {
+        ExecutorFactoryFunc factory = CreateOrchestratorAsync;
+        return factory.BindExecutor(nameof(SupervisorOrchestrator));
+
+        ValueTask<SupervisorOrchestrator> CreateOrchestratorAsync(ExecutorConfig<ExecutorOptions> options, string sessionId)
+        {
+            return new(new SupervisorOrchestrator(managerAgent, team, limits, requirePlanSignoff));
+        }
+    }
+}
